@@ -2,7 +2,7 @@
 
 <div align="center">
   
-  ![Dynexus Logo](https://i.imgur.com/sample-image-link.png)
+  ![Dynexus Logo](https://i.postimg.cc/yxvFyJBx/icon-9.png)
 
 **Automate Your Faculty Feedback Process**
 
@@ -43,7 +43,7 @@ This tool is specifically designed for **Amity University** students and works e
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/mediax1/dynexus-feedback-tool.git
+   git clone https://github.com/mediax1/amizone-autofill-feedback.git
    cd dynexus-feedback-tool
    ```
 
@@ -131,7 +131,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 <div align="center">
-  <img src="https://imgur.com/a/q56a9pB" width="200">
+  <img src="https://i.postimg.cc/yxvFyJBx/icon-9.png" width="200">
   
   <p>Made with ❤️ by the Dynexus Community</p>
 </div>
