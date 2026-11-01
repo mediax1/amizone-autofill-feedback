@@ -1,8 +1,9 @@
-import time
+﻿import time
 import random
 import logging
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -33,7 +34,11 @@ const done = arguments[arguments.length - 1];
 const delayMs = arguments[0] * 1000;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-const radios = Array.from(document.querySelectorAll("input[type='radio']"));
+const inSmallDialog = r => {
+  const d = r.closest(".modal, [role='dialog'], [role='alertdialog']");
+  return d && d.querySelectorAll("input[type='radio']").length < 4;
+};
+const radios = Array.from(document.querySelectorAll("input[type='radio']")).filter(r => !inSmallDialog(r));
 
 const labelText = r => {
   const l = r.closest('label') || (r.id && document.querySelector(`label[for="${r.id}"]`));
@@ -62,14 +67,23 @@ const labelText = r => {
 })();
 """
 
-POPUP_XPATHS = [
-    "//button[contains(@class,'close')]",
-    "//button[contains(text(),'OK')]",
-    "//button[contains(text(),'Got it')]",
-    "//button[contains(text(),'Dismiss')]",
-    "//div[contains(@role,'dialog')]//button",
-    "//div[contains(@class,'modal')]//button",
-]
+VISIBLE_POPUPS_JS = r"""
+const vis = e => {
+  const r = e.getBoundingClientRect();
+  const s = getComputedStyle(e);
+  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+};
+const sel = ".modal, [role='dialog'], [role='alertdialog'], .swal2-popup, .bootbox, .ui-dialog";
+return Array.from(document.querySelectorAll(sel))
+  .filter(vis)
+  .filter(e => !e.querySelector("textarea") && e.querySelectorAll("input[type='radio']").length < 4);
+"""
+
+DISMISS_TEXTS = ("ok", "got it", "dismiss", "close", "continue", "done", "no thanks")
+POPUP_BUTTONS_XPATH = (
+    ".//button | .//input[@type='button' or @type='submit'] "
+    "| .//a[contains(@class,'btn')] | .//*[@data-dismiss] | .//*[contains(@class,'close')]"
+)
 
 SUBMIT_XPATHS = [
     "//input[@id='btnSubmit']",
@@ -108,19 +122,81 @@ def make_driver():
     return uc.Chrome(options=options)
 
 
-def handle_popups(driver):
-    for sel in POPUP_XPATHS:
-        for btn in driver.find_elements(By.XPATH, sel):
-            try:
-                if btn.is_displayed():
-                    btn.click()
-                    time.sleep(0.3)
-            except Exception as e:
-                log.debug("popup click skipped: %s", e)
+def _visible_popups(driver):
     try:
-        driver.switch_to.alert.accept()
-    except Exception:
-        pass
+        return driver.execute_script(VISIBLE_POPUPS_JS) or []
+    except Exception as e:
+        log.debug("popup scan failed: %s", e)
+        return []
+
+
+def _pick_dismiss_button(popup):
+    fallback = None
+    for b in popup.find_elements(By.XPATH, POPUP_BUTTONS_XPATH):
+        try:
+            if not b.is_displayed():
+                continue
+            label = (b.text or b.get_attribute("value") or "").strip().lower()
+            cls = (b.get_attribute("class") or "").lower()
+        except StaleElementReferenceException:
+            continue
+        if label in DISMISS_TEXTS:
+            return b
+        if b.get_attribute("data-dismiss") or "close" in cls:
+            fallback = fallback or b
+    return fallback
+
+
+def _is_gone(el):
+    try:
+        return not el.is_displayed()
+    except StaleElementReferenceException:
+        return True
+
+
+def handle_popups(driver, timeout=5.0, quiet=0.0):
+    deadline = time.time() + timeout
+    quiet_since = None
+    closed = 0
+    while time.time() < deadline:
+        try:
+            driver.switch_to.alert.accept()
+            closed += 1
+            continue
+        except Exception:
+            pass
+
+        popups = _visible_popups(driver)
+        if not popups:
+            if quiet <= 0:
+                break
+            quiet_since = quiet_since or time.time()
+            if time.time() - quiet_since >= quiet:
+                break
+            time.sleep(0.1)
+            continue
+
+        quiet_since = None
+        popup = popups[-1]
+        btn = _pick_dismiss_button(popup)
+        try:
+            if btn is not None:
+                click_element(driver, btn)
+            else:
+                popup.send_keys(Keys.ESCAPE)
+            closed += 1
+        except Exception as e:
+            log.debug("popup dismiss failed: %s", e)
+        try:
+            WebDriverWait(driver, 2, poll_frequency=0.1).until(
+                lambda d: _is_gone(popup)
+            )
+        except TimeoutException:
+            log.debug("popup still visible after dismiss")
+            time.sleep(0.2)
+    if closed:
+        log.info("Closed %d popup(s)", closed)
+    return closed
 
 
 def click_element(driver, el):
@@ -203,7 +279,7 @@ def submit_and_wait(driver):
             except TimeoutException:
                 log.warning("Submit button still visible after 15s")
                 return False
-            handle_popups(driver)
+            handle_popups(driver, quiet=0.8)
             return True
     log.warning("No submit button found")
     return False
@@ -219,8 +295,7 @@ def wait_for_login(driver):
     except TimeoutException:
         raise RuntimeError("Login not detected within the timeout")
     log.info("Logged in.")
-    time.sleep(1)
-    handle_popups(driver)
+    handle_popups(driver, quiet=1.5)
 
 
 MY_FACULTY_XPATHS = [
@@ -257,11 +332,90 @@ def process_feedback(driver, btn):
     except TimeoutException:
         log.warning("Feedback form did not load")
         return False
-    handle_popups(driver)
+    handle_popups(driver, quiet=1.0)
     fill_options(driver)
     add_comment(driver)
     return submit_and_wait(driver)
 
+
+TIMELINE_ITEMS_XPATH = "//ul[contains(@class,'timeline')]/li"
+FEEDBACK_IN_ITEM_XPATH = (
+    ".//a[contains(@class,'btn') and contains(.,'Feedback') "
+    "and not(contains(.,'Post Message'))]"
+)
+
+
+def get_items(driver):
+    return driver.find_elements(By.XPATH, TIMELINE_ITEMS_XPATH)
+
+
+def item_feedback_button(item):
+    for el in item.find_elements(By.XPATH, FEEDBACK_IN_ITEM_XPATH):
+        try:
+            if el.is_displayed():
+                return el
+        except StaleElementReferenceException:
+            continue
+    return None
+
+
+def open_item(driver, item):
+    try:
+        panel = item.find_element(By.XPATH, ".//div[contains(@class,'text')]")
+        if panel.is_displayed():
+            return
+        header = item.find_element(By.XPATH, ".//div[@class='subject']")
+        click_element(driver, header)
+        WebDriverWait(driver, 3).until(lambda d: panel.is_displayed())
+    except Exception as e:
+        log.debug("open_item: %s", e)
+
+
+def scan_all_subjects(driver):
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.XPATH, TIMELINE_ITEMS_XPATH))
+        )
+    except TimeoutException:
+        log.warning("No faculty list found. Falling back to manual mode.")
+        return
+    total = len(get_items(driver))
+    log.info("Found %d faculty entries. Scanning...", total)
+
+    done = 0
+    for i in range(total):
+        items = get_items(driver)
+        if i >= len(items):
+            log.info("Page changed; reopening My Faculty.")
+            open_my_faculty(driver)
+            time.sleep(2)
+            items = get_items(driver)
+            if i >= len(items):
+                break
+        item = items[i]
+        try:
+            subject = item.find_element(By.XPATH, ".//div[@class='subject']").text.strip()
+            faculty = item.find_element(
+                By.XPATH, ".//*[contains(@class,'faculty-name')]"
+            ).get_attribute("textContent").strip()
+        except Exception:
+            subject, faculty = "?", "?"
+        log.info("[%d/%d] %s | %s", i + 1, total, subject, faculty)
+
+        open_item(driver, item)
+        time.sleep(0.4)
+        btn = item_feedback_button(item)
+        if btn is None:
+            log.info("  No Feedback button (already submitted).")
+            continue
+
+        if process_feedback(driver, btn):
+            done += 1
+            log.info("  Submitted.")
+            time.sleep(1.5)
+        else:
+            log.error("  Submission failed.")
+    log.info("Auto scan finished. Submitted %d of %d.", done, total)
 
 def watch_and_fill(driver):
     log.info("Watching for Feedback button. Click a faculty row to begin. Ctrl+C to stop.")
@@ -306,6 +460,7 @@ def main():
     try:
         wait_for_login(driver)
         open_my_faculty(driver)
+        scan_all_subjects(driver)
         watch_and_fill(driver)
     except RuntimeError as e:
         log.error("%s", e)
